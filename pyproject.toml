@@ -1,0 +1,6 @@
+ip,role,name
+192.168.1.10,Engineering Workstation,EWS-1
+192.168.1.20,HMI,HMI-Line3
+192.168.1.5,PLC/RTU,PLC-Mixer1
+192.168.1.2,SCADA Server,SCADA-Primary
+192.168.1.50,Historian,Historian-01
