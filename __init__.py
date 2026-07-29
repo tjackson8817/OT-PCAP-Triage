@@ -82,7 +82,7 @@ def kb_block(md, key):
 
 
 def render_markdown(findings, source_file, assets=None, baseline_diff=None,
-                     suppressed_count=0, trend_md=None):
+                     suppressed_count=0, trend_md=None, crossref_md=None):
     summary_rows = build_summary_rows(findings, assets)
 
     md = []
@@ -236,6 +236,10 @@ def render_markdown(findings, source_file, assets=None, baseline_diff=None,
 
     if trend_md:
         md.append(trend_md)
+        md.append("")
+
+    if crossref_md:
+        md.append(crossref_md)
         md.append("")
 
     md.append("---")

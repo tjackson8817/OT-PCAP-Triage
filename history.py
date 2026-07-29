@@ -1,163 +1,159 @@
-#!/usr/bin/env python3
 """
-OT PCAP Triage Tool -- CLI
+Fenceline Cross-Reference (importable module)
+================================================
 
-Usage:
-    ot-pcap-triage capture.pcap
-    ot-pcap-triage capture.pcap --assets assets.csv --suppress suppressions.csv
-    ot-pcap-triage capture.pcap --save-baseline baseline.json
-    ot-pcap-triage capture.pcap --baseline baseline.json --history history.json
-    ot-pcap-triage --batch /path/to/pcaps/ --out-dir reports/
+Connects two tools that answer different questions:
+  - Fenceline: "what's been disclosed" (CISA ICS advisories, enriched)
+  - ot_pcap_triage: "what's actually on the wire"
+
+Matches against Fenceline's confirmed real advisories.json schema:
+    exec_headline, business_impact, sector, cve_ids, vendor, product,
+    attack_ics_technique {id, name, url} | null, exploit_maturity,
+    cvss_score, ot_risk_rating, ot_risk_rationale, patch_status,
+    known_mitigation, mitigation_confidence, purdue_level_estimate,
+    severity_tier, source_url
+
+Two independent match signals, reported separately:
+  1. ATT&CK technique match (strong) -- both tools tag MITRE ATT&CK for
+     ICS techniques; a shared technique ID is a precise, non-keyword match.
+  2. Protocol keyword match (broader) -- product/vendor/summary text
+     matched against protocols actually observed in your traffic.
 """
 
-import argparse
-import glob
-import json
-import os
-import sys
+ADVISORY_TEXT_FIELDS = ["exec_headline", "business_impact", "ot_risk_rationale", "product", "vendor", "sector"]
 
-from .detect import triage
-from .assets import load_assets
-from .suppress import load_suppressions, apply_suppressions
-from .baseline import diff_baseline
-from .history import append_history, render_trend_markdown
-from .report_md import render_markdown, build_summary_rows, render_executive_summary
-from .report_html import render_html
+PROTOCOL_KEYWORDS = {
+    "modbus": ["modbus"],
+    "s7": ["s7", "s7comm", "step 7", "simatic"],
+    "dnp3": ["dnp3"],
+    "ethernet/ip": ["ethernet/ip", "ethernet-ip", "cip ", "common industrial protocol"],
+    "profinet": ["profinet"],
+    "bacnet": ["bacnet"],
+    "iec 60870-5-104": ["iec 60870", "60870-5-104", "iec104"],
+    "iec 61850": ["iec 61850", "goose", "sampled values", "mms"],
+}
 
-
-def run_one(pcap_path, args, assets, suppressions):
-    findings = triage(pcap_path, assets=assets)
-    suppressed_count = apply_suppressions(findings, suppressions) if suppressions else 0
-
-    baseline_diff = None
-    if args.baseline:
-        with open(args.baseline) as f:
-            baseline_sig = json.load(f)
-        baseline_diff = diff_baseline(findings.signature, baseline_sig)
-
-    trend_md = None
-    if args.history:
-        summary_rows_preview = build_summary_rows(findings, assets)
-        history = append_history(args.history, pcap_path, summary_rows_preview, findings.meta["total_packets"])
-        trend_md = render_trend_markdown(history)
-
-    report_md, summary_rows = render_markdown(
-        findings, pcap_path, assets=assets, baseline_diff=baseline_diff,
-        suppressed_count=suppressed_count, trend_md=trend_md,
-    )
-
-    if args.save_baseline:
-        with open(args.save_baseline, "w") as f:
-            json.dump(findings.signature, f, indent=2, default=str)
-
-    return findings, report_md, summary_rows, baseline_diff, suppressed_count
+PCAP_TRIAGE_ATTACK_IDS = {"T0846", "T0855", "T0831", "T0869", "T0884", "T0888"}
 
 
-def write_outputs(pcap_path, findings, report_md, summary_rows, baseline_diff,
-                   suppressed_count, out_md, out_html=None, out_json=None, assets=None):
-    with open(out_md, "w") as f:
-        f.write(report_md)
-
-    if out_html:
-        from .report_html import markdown_bold_to_html
-        exec_text = render_executive_summary(summary_rows, pcap_path, suppressed_count)
-        exec_html_lines = "<br>".join(markdown_bold_to_html(l) for l in exec_text.split("\n") if l.strip())
-        html_report = render_html(
-            findings, pcap_path, summary_rows, assets=assets, baseline_diff=baseline_diff,
-            suppressed_count=suppressed_count, exec_summary_text=exec_html_lines,
-        )
-        with open(out_html, "w") as f:
-            f.write(html_report)
-
-    if out_json:
-        payload = {
-            "meta": findings.meta,
-            "network_discovery": findings.network_discovery,
-            "suspicious": findings.suspicious,
-            "modbus": findings.modbus,
-            "other_protocols": findings.other_protocols,
-        }
-        with open(out_json, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
+def advisory_text(advisory):
+    parts = []
+    for field in ADVISORY_TEXT_FIELDS:
+        val = advisory.get(field)
+        if val:
+            parts.append(str(val))
+    return " ".join(parts).lower()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Triage pcap(s) for OT/ICS security findings.")
-    parser.add_argument("pcap", nargs="?", help="Path to .pcap or .pcapng file")
-    parser.add_argument("--batch", default=None, help="Directory of pcaps to process; produces one report per file plus an aggregate summary")
-    parser.add_argument("--out", default=None, help="Markdown report path (single-file mode; default: <pcap>.report.md)")
-    parser.add_argument("--out-dir", default="reports", help="Output directory for --batch mode")
-    parser.add_argument("--html", action="store_true", help="Also write an HTML report alongside the Markdown")
-    parser.add_argument("--json", default=None, help="Optional path to also write raw findings as JSON (single-file mode)")
-    parser.add_argument("--assets", default=None, help="Optional CSV (ip,role,name) of known assets for host annotation")
-    parser.add_argument("--suppress", default=None, help="Optional CSV (src,dst,category) of previously-triaged findings to silence")
-    parser.add_argument("--baseline", default=None, help="Optional prior baseline signature JSON to diff against")
-    parser.add_argument("--save-baseline", default=None, help="Path to save this run's signature as a future baseline")
-    parser.add_argument("--history", default=None, help="Optional path to a trend-history JSON file (appended to each run)")
-    args = parser.parse_args()
-
-    assets = load_assets(args.assets) if args.assets else None
-    suppressions = load_suppressions(args.suppress) if args.suppress else None
-
-    if args.batch:
-        pcap_files = sorted(
-            glob.glob(os.path.join(args.batch, "*.pcap")) +
-            glob.glob(os.path.join(args.batch, "*.pcapng"))
-        )
-        if not pcap_files:
-            print(f"No .pcap/.pcapng files found in {args.batch}", file=sys.stderr)
-            sys.exit(1)
-
-        os.makedirs(args.out_dir, exist_ok=True)
-        aggregate = []
-        for pcap_path in pcap_files:
-            base = os.path.splitext(os.path.basename(pcap_path))[0]
-            findings, report_md, summary_rows, baseline_diff, suppressed_count = run_one(
-                pcap_path, args, assets, suppressions
-            )
-            out_md = os.path.join(args.out_dir, f"{base}.report.md")
-            out_html = os.path.join(args.out_dir, f"{base}.report.html") if args.html else None
-            out_json = os.path.join(args.out_dir, f"{base}.report.json") if args.json else None
-            write_outputs(pcap_path, findings, report_md, summary_rows, baseline_diff,
-                          suppressed_count, out_md, out_html, out_json, assets=assets)
-            aggregate.append((pcap_path, summary_rows))
-            print(f"[{base}] {len(summary_rows)} finding categories -> {out_md}", file=sys.stderr)
-
-        agg_path = os.path.join(args.out_dir, "_aggregate_summary.md")
-        with open(agg_path, "w") as f:
-            f.write("# Batch Triage -- Aggregate Summary\n\n")
-            f.write(f"Processed {len(pcap_files)} capture(s) from `{args.batch}`\n\n")
-            f.write("| File | Critical | High | Medium | Low |\n|---|---|---|---|---|\n")
-            for pcap_path, summary_rows in aggregate:
-                counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-                for sev, _title, cnt in summary_rows:
-                    if sev in counts:
-                        counts[sev] += cnt
-                f.write(f"| {os.path.basename(pcap_path)} | {counts['CRITICAL']} | {counts['HIGH']} | "
-                        f"{counts['MEDIUM']} | {counts['LOW']} |\n")
-        print(f"\n[Aggregate summary written to {agg_path}]", file=sys.stderr)
-        return
-
-    if not args.pcap:
-        parser.error("pcap is required unless --batch is used")
-
-    findings, report_md, summary_rows, baseline_diff, suppressed_count = run_one(
-        args.pcap, args, assets, suppressions
-    )
-    out_md = args.out or (args.pcap + ".report.md")
-    out_html = (os.path.splitext(out_md)[0] + ".html") if args.html else None
-    write_outputs(args.pcap, findings, report_md, summary_rows, baseline_diff,
-                  suppressed_count, out_md, out_html, args.json, assets=assets)
-
-    print(report_md)
-    print(f"\n\n[Report written to {out_md}]", file=sys.stderr)
-    if out_html:
-        print(f"[HTML report written to {out_html}]", file=sys.stderr)
-    if args.json:
-        print(f"[JSON written to {args.json}]", file=sys.stderr)
-    if args.save_baseline:
-        print(f"[Baseline signature saved to {args.save_baseline}]", file=sys.stderr)
+def advisory_label(advisory):
+    cves = advisory.get("cve_ids") or []
+    headline = advisory.get("exec_headline")
+    if cves and headline:
+        return f"{', '.join(cves)} -- {headline}"
+    if headline:
+        return headline
+    if cves:
+        return ", ".join(cves)
+    return advisory.get("source_url") or "(unlabeled advisory)"
 
 
-if __name__ == "__main__":
-    main()
+def observed_protocols(pcap_findings):
+    observed = set()
+    if pcap_findings.get("modbus", {}).get("conversations"):
+        observed.add("modbus")
+    for proto_name in pcap_findings.get("other_protocols", {}):
+        name_lower = proto_name.lower()
+        for key, keywords in PROTOCOL_KEYWORDS.items():
+            if key in name_lower or any(kw in name_lower for kw in keywords):
+                observed.add(key)
+    return observed
+
+
+def observed_attack_ids(pcap_findings):
+    ids = set()
+    sus = pcap_findings.get("suspicious", {})
+    mb = pcap_findings.get("modbus", {})
+
+    if sus.get("possible_port_scanners"):
+        ids.add("T0846")
+    if (mb.get("write_single_coil_events") or mb.get("write_multiple_registers_events")):
+        ids.add("T0855")
+        ids.add("T0831")
+    if sus.get("modbus_over_nonstandard_port"):
+        ids.add("T0869")
+    if sus.get("long_tcp_sessions_bytes_in_flight") or sus.get("ot_traffic_to_internet"):
+        ids.add("T0884")
+    if mb.get("device_identification_events"):
+        ids.add("T0888")
+    return ids
+
+
+def cross_reference(pcap_findings, advisories):
+    observed_proto = observed_protocols(pcap_findings)
+    observed_attack = observed_attack_ids(pcap_findings)
+
+    technique_matches = []
+    keyword_matches = []
+
+    for advisory in advisories:
+        technique = advisory.get("attack_ics_technique")
+        if technique and technique.get("id") in observed_attack:
+            technique_matches.append({
+                "advisory": advisory_label(advisory),
+                "matched_technique": technique,
+                "severity_tier": advisory.get("severity_tier"),
+                "ot_risk_rating": advisory.get("ot_risk_rating"),
+                "known_mitigation": advisory.get("known_mitigation"),
+                "mitigation_confidence": advisory.get("mitigation_confidence"),
+            })
+            continue
+
+        text = advisory_text(advisory)
+        hit_protocols = {key for key, kws in PROTOCOL_KEYWORDS.items()
+                         if key in observed_proto and any(kw in text for kw in kws)}
+        if hit_protocols:
+            keyword_matches.append({
+                "advisory": advisory_label(advisory),
+                "matched_protocols": sorted(hit_protocols),
+                "severity_tier": advisory.get("severity_tier"),
+                "ot_risk_rating": advisory.get("ot_risk_rating"),
+            })
+
+    return {
+        "protocols_observed_in_traffic": sorted(observed_proto),
+        "attack_ids_observed_in_traffic": sorted(observed_attack),
+        "advisories_checked": len(advisories),
+        "technique_matches": technique_matches,
+        "keyword_matches": keyword_matches,
+    }
+
+
+def render_crossref_markdown(result):
+    md = ["## Related Disclosed Advisories (Fenceline Cross-Reference)\n"]
+    md.append(f"Checked against {result['advisories_checked']} disclosed advisories from Fenceline.\n")
+
+    md.append(f"### Technique Matches (strongest signal): {len(result['technique_matches'])}")
+    if result["technique_matches"]:
+        md.append("These map to the exact same MITRE ATT&CK for ICS technique this capture's traffic was flagged for.\n")
+        for m in result["technique_matches"]:
+            md.append(f"- **{m['advisory']}**")
+            md.append(f"  - ATT&CK match: {m['matched_technique']['id']} {m['matched_technique']['name']}")
+            md.append(f"  - Fenceline severity: {m['severity_tier']} (OT risk: {m['ot_risk_rating']})")
+            md.append(f"  - Known mitigation ({m['mitigation_confidence']}): {m['known_mitigation']}")
+    else:
+        md.append("None.")
+
+    md.append(f"\n### Protocol Keyword Matches (broader signal): {len(result['keyword_matches'])}")
+    if result["keyword_matches"]:
+        for m in result["keyword_matches"]:
+            md.append(f"- **{m['advisory']}** \u2014 matched on {', '.join(m['matched_protocols'])} "
+                     f"(severity {m['severity_tier']}, OT risk {m['ot_risk_rating']})")
+    else:
+        md.append("None.")
+
+    md.append("\n*Technique matches are a precise, non-keyword match against MITRE ATT&CK for ICS. "
+              "Protocol keyword matches are broader and mean the advisory concerns a protocol observed "
+              "in your traffic, not that the specific device/version is confirmed present on your "
+              "network -- treat both as prioritization signals, not confirmed exposure.*")
+    return "\n".join(md)
+
