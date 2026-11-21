@@ -1,40 +1,85 @@
-from ot_pcap_triage import triage, build_summary_rows
-from ot_pcap_triage.assets import annotate_host
+import struct
+import pytest
+from scapy.all import Ether, ARP, IP, TCP, UDP, Raw, wrpcap
 
 
-def test_modbus_write_detected(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    assert len(findings.modbus["write_multiple_registers_events"]) == 1
-    assert findings.modbus["write_multiple_registers_events"][0] == ("10.0.0.5", "10.0.0.50")
+def modbus_payload(function_code, transaction_id=1, unit_id=1):
+    """Builds a minimal Modbus/TCP MBAP + PDU byte string."""
+    protocol_id = 0
+    length = 2  # unit id + function code (+ any extra, kept minimal for tests)
+    header = struct.pack(">HHHB", transaction_id, protocol_id, length, unit_id)
+    return header + bytes([function_code])
 
 
-def test_modbus_write_baseline_severity_is_high(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    rows = build_summary_rows(findings, assets=None)
-    write_rows = [r for r in rows if "Write" in r[1]]
-    assert write_rows and write_rows[0][0] == "HIGH"
+@pytest.fixture
+def tmp_pcap_path(tmp_path):
+    return str(tmp_path / "test.pcap")
 
 
-def test_modbus_write_escalates_with_unrecognized_asset(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    # asset list that does NOT include the writer 10.0.0.5
-    assets = {"10.0.0.50": {"role": "PLC", "name": "PLC-1"}}
-    rows = build_summary_rows(findings, assets=assets)
-    write_rows = [r for r in rows if "Write" in r[1]]
-    assert write_rows and write_rows[0][0] == "CRITICAL"
+@pytest.fixture
+def modbus_write_pcap(tmp_path):
+    """One legit-looking Modbus conversation with a Write Multiple Registers (16) call."""
+    path = str(tmp_path / "modbus_write.pcap")
+    pkts = [
+        Ether(src="aa:bb:cc:dd:ee:01", dst="aa:bb:cc:dd:ee:02")
+        / IP(src="10.0.0.5", dst="10.0.0.50")
+        / TCP(sport=51000, dport=502)
+        / Raw(load=modbus_payload(16)),
+    ]
+    wrpcap(path, pkts)
+    return path
 
 
-def test_modbus_write_stays_high_with_recognized_asset(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    assets = {"10.0.0.5": {"role": "Engineering Workstation", "name": "EWS-1"},
-              "10.0.0.50": {"role": "PLC", "name": "PLC-1"}}
-    rows = build_summary_rows(findings, assets=assets)
-    write_rows = [r for r in rows if "Write" in r[1]]
-    assert write_rows and write_rows[0][0] == "HIGH"
+@pytest.fixture
+def port_scan_pcap(tmp_path):
+    """SYN-without-ACK from one source across 20 destination ports."""
+    path = str(tmp_path / "port_scan.pcap")
+    pkts = [
+        Ether() / IP(src="10.0.0.99", dst="10.0.0.5") / TCP(sport=44000 + p, dport=p, flags="S")
+        for p in range(1, 21)
+    ]
+    wrpcap(path, pkts)
+    return path
 
 
-def test_annotate_host_recognized_and_unrecognized():
-    assets = {"10.0.0.5": {"role": "PLC", "name": "PLC-1"}}
-    assert "recognized" in annotate_host("10.0.0.5", assets)
-    assert "UNRECOGNIZED" in annotate_host("10.0.0.99", assets)
-    assert annotate_host("10.0.0.5", None) == "10.0.0.5"
+@pytest.fixture
+def internet_traffic_pcap(tmp_path):
+    """One OT-looking host (private) talking to a public IP address."""
+    path = str(tmp_path / "internet_traffic.pcap")
+    pkts = [
+        Ether() / IP(src="10.0.0.5", dst="8.8.8.8") / TCP(sport=51000, dport=443, flags="S"),
+    ]
+    wrpcap(path, pkts)
+    return path
+
+
+@pytest.fixture
+def iec104_pcap(tmp_path):
+    """Traffic on TCP/2404 (IEC 60870-5-104)."""
+    path = str(tmp_path / "iec104.pcap")
+    pkts = [
+        Ether() / IP(src="10.0.0.5", dst="10.0.0.60") / TCP(sport=51000, dport=2404) / Raw(load=b"\x68\x04\x07\x00\x00\x00"),
+    ]
+    wrpcap(path, pkts)
+    return path
+
+
+@pytest.fixture
+def goose_pcap(tmp_path):
+    """Raw-Ethernet GOOSE frame (EtherType 0x88B8)."""
+    path = str(tmp_path / "goose.pcap")
+    pkts = [
+        Ether(src="aa:bb:cc:00:00:01", dst="01:0c:cd:01:00:01", type=0x88B8) / Raw(load=b"\x00" * 40),
+    ]
+    wrpcap(path, pkts)
+    return path
+
+
+@pytest.fixture
+def arp_pcap(tmp_path):
+    path = str(tmp_path / "arp.pcap")
+    pkts = [
+        Ether() / ARP(op=2, psrc="10.0.0.5", hwsrc="aa:bb:cc:dd:ee:01"),
+    ]
+    wrpcap(path, pkts)
+    return path

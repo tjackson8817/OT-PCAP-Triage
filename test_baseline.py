@@ -1,39 +1,18 @@
-from ot_pcap_triage import triage, apply_suppressions
+from ot_pcap_triage import triage, diff_baseline
 
 
-def test_suppress_specific_modbus_write(modbus_write_pcap):
+def test_baseline_diff_detects_new_mac(modbus_write_pcap, port_scan_pcap):
+    baseline_findings = triage(modbus_write_pcap)
+    current_findings = triage(port_scan_pcap)
+
+    diff = diff_baseline(current_findings.signature, baseline_findings.signature)
+    # port_scan_pcap uses scapy default random-ish MACs, distinct from modbus_write_pcap's explicit ones
+    assert len(diff["new_macs"]) > 0
+
+
+def test_baseline_diff_no_new_items_against_self(modbus_write_pcap):
     findings = triage(modbus_write_pcap)
-    assert len(findings.modbus["write_multiple_registers_events"]) == 1
-
-    rules = [{"src": "10.0.0.5", "dst": "10.0.0.50", "category": "modbus_write"}]
-    suppressed_count = apply_suppressions(findings, rules)
-
-    assert suppressed_count == 1
-    assert findings.modbus["write_multiple_registers_events"] == []
-
-
-def test_suppress_wildcard_category_does_not_match_other_categories(internet_traffic_pcap):
-    findings = triage(internet_traffic_pcap)
-    assert len(findings.suspicious["ot_traffic_to_internet"]) == 1
-
-    # rule targets a totally different category -- should not suppress internet traffic
-    rules = [{"src": "*", "dst": "*", "category": "modbus_write"}]
-    suppressed_count = apply_suppressions(findings, rules)
-
-    assert suppressed_count == 0
-    assert len(findings.suspicious["ot_traffic_to_internet"]) == 1
-
-
-def test_suppress_wildcard_matches_correct_category(internet_traffic_pcap):
-    findings = triage(internet_traffic_pcap)
-    rules = [{"src": "*", "dst": "*", "category": "ot_to_internet"}]
-    suppressed_count = apply_suppressions(findings, rules)
-    assert suppressed_count == 1
-    assert findings.suspicious["ot_traffic_to_internet"] == []
-
-
-def test_no_suppressions_is_noop(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    suppressed_count = apply_suppressions(findings, [])
-    assert suppressed_count == 0
-    assert len(findings.modbus["write_multiple_registers_events"]) == 1
+    diff = diff_baseline(findings.signature, findings.signature)
+    assert diff["new_macs"] == []
+    assert diff["new_modbus_conversations"] == []
+    assert diff["new_internet_destinations"] == []

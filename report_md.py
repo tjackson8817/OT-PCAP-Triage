@@ -1,228 +1,269 @@
-#!/usr/bin/env python3
-"""
-OT PCAP Triage Tool -- CLI
+"""Markdown report rendering, including a plain-English executive summary."""
 
-Usage:
-    ot-pcap-triage capture.pcap
-    ot-pcap-triage capture.pcap --assets assets.csv --suppress suppressions.csv
-    ot-pcap-triage capture.pcap --save-baseline baseline.json
-    ot-pcap-triage capture.pcap --baseline baseline.json --history history.json
-    ot-pcap-triage --batch /path/to/pcaps/ --out-dir reports/
-"""
-
-import argparse
-import glob
-import json
-import os
-import sys
-
-from .detect import triage
-from .assets import load_assets
-from .suppress import load_suppressions, apply_suppressions
-from .baseline import diff_baseline
-from .history import append_history, render_trend_markdown
-from .report_md import render_markdown, build_summary_rows, render_executive_summary
-from .report_html import render_html
-from .fenceline import cross_reference, render_crossref_markdown
-from .exec_report import render_exec_html
+from .kb import KB, SEVERITY_ORDER, escalate, summary_counts, modbus_writers
+from .assets import annotate_host
 
 
-def run_one(pcap_path, args, assets, suppressions):
-    findings = triage(pcap_path, assets=assets)
-    suppressed_count = apply_suppressions(findings, suppressions) if suppressions else 0
+def build_summary_rows(findings, assets):
+    sus = findings.suspicious
+    mb = findings.modbus
+    ctrl = getattr(findings, "control", {}) or {}
+    rows = [(KB[k]["severity"], KB[k]["title"], n) for k, n in summary_counts(sus, mb, ctrl) if n]
 
-    baseline_diff = None
-    if args.baseline:
-        with open(args.baseline) as f:
-            baseline_sig = json.load(f)
-        baseline_diff = diff_baseline(findings.signature, baseline_sig)
+    if assets:
+        escalate_titles = set()
+        if any(w not in assets for w in modbus_writers(mb)):
+            escalate_titles.add(KB["modbus_write"]["title"])
+        if any(c[0] not in assets for c in ctrl.get("commands", [])):
+            escalate_titles.add(KB["ot_control_commands"]["title"])
+        rows = [(escalate(sev, 1) if title in escalate_titles else sev, title, cnt) for sev, title, cnt in rows]
 
-    trend_md = None
-    if args.history:
-        summary_rows_preview = build_summary_rows(findings, assets)
-        history = append_history(args.history, pcap_path, summary_rows_preview, findings.meta["total_packets"])
-        trend_md = render_trend_markdown(history)
-
-    crossref_result = None
-    crossref_md = None
-    if args.fenceline_advisories:
-        payload = {
-            "meta": findings.meta,
-            "network_discovery": findings.network_discovery,
-            "suspicious": findings.suspicious,
-            "modbus": findings.modbus,
-            "other_protocols": findings.other_protocols,
-        }
-        with open(args.fenceline_advisories) as f:
-            advisories = json.load(f)
-            if isinstance(advisories, dict):
-                advisories = advisories.get("advisories", [])
-        crossref_result = cross_reference(payload, advisories)
-        crossref_md = render_crossref_markdown(crossref_result)
-
-    report_md, summary_rows = render_markdown(
-        findings, pcap_path, assets=assets, baseline_diff=baseline_diff,
-        suppressed_count=suppressed_count, trend_md=trend_md, crossref_md=crossref_md,
-    )
-
-    if args.save_baseline:
-        with open(args.save_baseline, "w") as f:
-            json.dump(findings.signature, f, indent=2, default=str)
-
-    return findings, report_md, summary_rows, baseline_diff, suppressed_count, crossref_result
+    rows.sort(key=lambda r: -SEVERITY_ORDER.index(r[0]))
+    return rows
 
 
-def write_outputs(pcap_path, findings, report_md, summary_rows, baseline_diff,
-                   suppressed_count, out_md, out_html=None, out_json=None, assets=None,
-                   out_pdf=None, crossref_result=None, out_exec_pdf=None, exec_meta=None):
-    with open(out_md, "w") as f:
-        f.write(report_md)
+def render_executive_summary(summary_rows, source_file, suppressed_count=0):
+    md = ["## Executive Summary\n"]
 
-    html_report = None
-    if out_html or out_pdf:
-        from .report_html import markdown_bold_to_html
-        exec_text = render_executive_summary(summary_rows, pcap_path, suppressed_count)
-        exec_lines = [l for l in exec_text.split("\n") if l.strip() and not l.strip().startswith("#")]
-        exec_html_lines = "<br>".join(markdown_bold_to_html(l) for l in exec_lines)
-        html_report = render_html(
-            findings, pcap_path, summary_rows, assets=assets, baseline_diff=baseline_diff,
-            suppressed_count=suppressed_count, exec_summary_text=exec_html_lines,
-        )
+    if not summary_rows:
+        md.append("**No findings triggered against current thresholds in this capture.** "
+                   "Nothing in this report requires action.")
+        if suppressed_count:
+            md.append(f"\n({suppressed_count} previously-triaged item(s) were suppressed per your allowlist.)")
+        return "\n".join(md)
 
-    if out_html:
-        with open(out_html, "w") as f:
-            f.write(html_report)
+    critical = sum(c for s, _, c in summary_rows if s == "CRITICAL")
+    high = sum(c for s, _, c in summary_rows if s == "HIGH")
+    top = summary_rows[0]
 
-    if out_pdf:
-        from .pdf import html_to_pdf
-        html_to_pdf(html_report, out_pdf)
+    if critical:
+        urgency = f"**{critical} Critical** finding(s) need review today."
+    elif high:
+        urgency = f"**{high} High** finding(s) should be reviewed this week."
+    else:
+        urgency = "Nothing Critical or High -- lower urgency, but worth a look."
 
-    if out_json:
-        payload = {
-            "meta": findings.meta,
-            "network_discovery": findings.network_discovery,
-            "suspicious": findings.suspicious,
-            "modbus": findings.modbus,
-            "other_protocols": findings.other_protocols,
-        }
-        with open(out_json, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
-
-    if out_exec_pdf:
-        from .pdf import html_to_pdf
-        payload = {
-            "meta": findings.meta,
-            "network_discovery": findings.network_discovery,
-            "suspicious": findings.suspicious,
-            "modbus": findings.modbus,
-            "other_protocols": findings.other_protocols,
-        }
-        meta = exec_meta or {}
-        exec_html = render_exec_html(
-            payload,
-            client=meta.get("client", "[Client Name]"),
-            site=meta.get("site", "[Site / Scope]"),
-            prepared_by=meta.get("prepared_by", "Thomas Jackson, Principal"),
-            firm=meta.get("firm", "Sale Fish Marketing & Consulting"),
-            crossref_result=crossref_result,
-        )
-        html_to_pdf(exec_html, out_exec_pdf)
+    md.append(f"**What happened:** This capture ({source_file}) was checked against "
+               f"{len(summary_rows)} categories of known OT/ICS network risk indicators; "
+               f"{sum(c for _, _, c in summary_rows)} individual events were flagged.")
+    md.append(f"\n**How urgent:** {urgency}")
+    md.append(f"\n**Look at this first:** {top[1]} ({top[2]} occurrence(s), severity {top[0]}).")
+    if suppressed_count:
+        md.append(f"\n*{suppressed_count} previously-triaged item(s) were suppressed per your allowlist "
+                   f"and are not counted above.*")
+    return "\n".join(md)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Triage pcap(s) for OT/ICS security findings.")
-    parser.add_argument("pcap", nargs="?", help="Path to .pcap or .pcapng file")
-    parser.add_argument("--batch", default=None, help="Directory of pcaps to process; produces one report per file plus an aggregate summary")
-    parser.add_argument("--out", default=None, help="Markdown report path (single-file mode; default: <pcap>.report.md)")
-    parser.add_argument("--out-dir", default="reports", help="Output directory for --batch mode")
-    parser.add_argument("--html", action="store_true", help="Also write an HTML report alongside the Markdown")
-    parser.add_argument("--json", default=None, help="Optional path to also write raw findings as JSON (single-file mode)")
-    parser.add_argument("--assets", default=None, help="Optional CSV (ip,role,name) of known assets for host annotation")
-    parser.add_argument("--suppress", default=None, help="Optional CSV (src,dst,category) of previously-triaged findings to silence")
-    parser.add_argument("--baseline", default=None, help="Optional prior baseline signature JSON to diff against")
-    parser.add_argument("--save-baseline", default=None, help="Path to save this run's signature as a future baseline")
-    parser.add_argument("--history", default=None, help="Optional path to a trend-history JSON file (appended to each run)")
-    parser.add_argument("--fenceline-advisories", default=None, help="Optional Fenceline advisories.json -- automatically cross-references and adds a section to the report")
-    parser.add_argument("--pdf", action="store_true", help="Also write a PDF version of the technical report (requires weasyprint)")
-    parser.add_argument("--exec-pdf", default=None, help="Path to write a branded executive-summary PDF (requires weasyprint)")
-    parser.add_argument("--client", default="[Client Name]", help="Client name for the executive PDF")
-    parser.add_argument("--site", default="[Site / Scope]", help="Site/scope description for the executive PDF")
-    parser.add_argument("--prepared-by", default="Thomas Jackson, Principal", help="Preparer name for the executive PDF")
-    parser.add_argument("--firm", default="Sale Fish Marketing & Consulting", help="Firm name for the executive PDF")
-    args = parser.parse_args()
-
-    assets = load_assets(args.assets) if args.assets else None
-    suppressions = load_suppressions(args.suppress) if args.suppress else None
-
-    if args.batch:
-        pcap_files = sorted(
-            glob.glob(os.path.join(args.batch, "*.pcap")) +
-            glob.glob(os.path.join(args.batch, "*.pcapng"))
-        )
-        if not pcap_files:
-            print(f"No .pcap/.pcapng files found in {args.batch}", file=sys.stderr)
-            sys.exit(1)
-
-        os.makedirs(args.out_dir, exist_ok=True)
-        aggregate = []
-        for pcap_path in pcap_files:
-            base = os.path.splitext(os.path.basename(pcap_path))[0]
-            findings, report_md, summary_rows, baseline_diff, suppressed_count, crossref_result = run_one(
-                pcap_path, args, assets, suppressions
-            )
-            out_md = os.path.join(args.out_dir, f"{base}.report.md")
-            out_html = os.path.join(args.out_dir, f"{base}.report.html") if (args.html or args.pdf) else None
-            out_json = os.path.join(args.out_dir, f"{base}.report.json") if args.json else None
-            out_pdf = os.path.join(args.out_dir, f"{base}.report.pdf") if args.pdf else None
-            write_outputs(pcap_path, findings, report_md, summary_rows, baseline_diff,
-                          suppressed_count, out_md, out_html, out_json, assets=assets,
-                          out_pdf=out_pdf, crossref_result=crossref_result)
-            aggregate.append((pcap_path, summary_rows))
-            print(f"[{base}] {len(summary_rows)} finding categories -> {out_md}", file=sys.stderr)
-
-        agg_path = os.path.join(args.out_dir, "_aggregate_summary.md")
-        with open(agg_path, "w") as f:
-            f.write("# Batch Triage -- Aggregate Summary\n\n")
-            f.write(f"Processed {len(pcap_files)} capture(s) from `{args.batch}`\n\n")
-            f.write("| File | Critical | High | Medium | Low |\n|---|---|---|---|---|\n")
-            for pcap_path, summary_rows in aggregate:
-                counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-                for sev, _title, cnt in summary_rows:
-                    if sev in counts:
-                        counts[sev] += cnt
-                f.write(f"| {os.path.basename(pcap_path)} | {counts['CRITICAL']} | {counts['HIGH']} | "
-                        f"{counts['MEDIUM']} | {counts['LOW']} |\n")
-        print(f"\n[Aggregate summary written to {agg_path}]", file=sys.stderr)
-        return
-
-    if not args.pcap:
-        parser.error("pcap is required unless --batch is used")
-
-    findings, report_md, summary_rows, baseline_diff, suppressed_count, crossref_result = run_one(
-        args.pcap, args, assets, suppressions
-    )
-    out_md = args.out or (args.pcap + ".report.md")
-    out_html = (os.path.splitext(out_md)[0] + ".html") if (args.html or args.pdf) else None
-    out_pdf = (os.path.splitext(out_md)[0] + ".pdf") if args.pdf else None
-    exec_meta = {"client": args.client, "site": args.site, "prepared_by": args.prepared_by, "firm": args.firm}
-    write_outputs(args.pcap, findings, report_md, summary_rows, baseline_diff,
-                  suppressed_count, out_md, out_html, args.json, assets=assets,
-                  out_pdf=out_pdf, crossref_result=crossref_result,
-                  out_exec_pdf=args.exec_pdf, exec_meta=exec_meta)
-
-    print(report_md)
-    print(f"\n\n[Report written to {out_md}]", file=sys.stderr)
-    if args.html:
-        print(f"[HTML report written to {out_html}]", file=sys.stderr)
-    if out_pdf:
-        print(f"[PDF report written to {out_pdf}]", file=sys.stderr)
-    if args.exec_pdf:
-        print(f"[Executive PDF written to {args.exec_pdf}]", file=sys.stderr)
-    if args.json:
-        print(f"[JSON written to {args.json}]", file=sys.stderr)
-    if args.save_baseline:
-        print(f"[Baseline signature saved to {args.save_baseline}]", file=sys.stderr)
+def kb_block(md, key):
+    kb = KB[key]
+    md.append(f"**Severity: {kb['severity']}**")
+    if kb["attack"]:
+        tags = ", ".join(f"{a['id']} {a['name']} ({a['tactic']}, {a['confidence']})" for a in kb["attack"])
+        md.append(f"**ATT&CK for ICS:** {tags}")
+    else:
+        md.append("**ATT&CK for ICS:** no single confirmed technique mapping -- treated as a general anomaly indicator")
+    md.append(f"**Why it matters:** {kb['why']}")
+    md.append(f"**Immediate action:** {kb['immediate']}")
+    md.append(f"**Remediation:** {kb['remediation']}")
+    md.append(f"**Reference:** {kb['reference']}")
 
 
-if __name__ == "__main__":
-    main()
+def render_markdown(findings, source_file, assets=None, baseline_diff=None,
+                     suppressed_count=0, trend_md=None, crossref_md=None):
+    summary_rows = build_summary_rows(findings, assets)
+
+    md = []
+    md.append("# OT PCAP Triage Report\n")
+    md.append(f"**Source file:** `{source_file}`  ")
+    md.append(f"**Generated:** {findings.meta['generated_at']}  ")
+    md.append(f"**Total packets analyzed:** {findings.meta['total_packets']}  ")
+    md.append(f"**Asset context provided:** {'Yes' if assets else 'No -- pass --assets to enable recognized/unrecognized host labeling'}  ")
+    if baseline_diff is not None:
+        md.append("**Baseline comparison:** enabled -- see 'New Since Baseline' section  ")
+    md.append("")
+
+    md.append(render_executive_summary(summary_rows, source_file, suppressed_count))
+    md.append("")
+
+    md.append("## Findings Summary (highest severity first)\n")
+    if summary_rows:
+        md.append("| Severity | Finding | Count |")
+        md.append("|---|---|---|")
+        for sev, title, cnt in summary_rows:
+            md.append(f"| {sev} | {title} | {cnt} |")
+    else:
+        md.append("No findings triggered against current thresholds.")
+    md.append("")
+
+    nd = findings.network_discovery
+    md.append("## Network Discovery\n")
+    md.append(f"- Broadcast frames: **{nd['broadcast_frames']}**")
+    md.append(f"- Unique MAC addresses seen: **{len(nd['unique_mac_addresses'])}**")
+    md.append(f"- ARP responses (IP -> MAC mappings): **{nd['arp_response_count']}**")
+    md.append(f"- DHCP Discover/Request events: **{nd['dhcp_event_count']}**")
+    md.append(f"- Unique IPs in 192.168.0.0/16: **{len(nd['unique_192_ips'])}**\n")
+
+    sus = findings.suspicious
+    mb = findings.modbus
+
+    md.append("## Suspicious Activity\n")
+
+    scanners = sus["possible_port_scanners"]
+    md.append(f"### Possible port scanning: {len(scanners)} source(s) flagged")
+    for src, targets in scanners.items():
+        md.append(f"- {annotate_host(src, assets)} hit **{len(targets)}** distinct dest ports/IPs (SYN-no-ACK)")
+    if scanners:
+        kb_block(md, "port_scanning")
+    md.append("")
+
+    md.append(f"### Connections to uncommon ports: {len(sus['uncommon_port_connections'])}")
+    for src, dst, port in sus["uncommon_port_connections"][:15]:
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)}:{port}")
+    if len(sus["uncommon_port_connections"]) > 15:
+        md.append(f"- ... and {len(sus['uncommon_port_connections']) - 15} more")
+    if sus["uncommon_port_connections"]:
+        kb_block(md, "uncommon_port")
+    md.append("")
+
+    md.append(f"### Modbus over non-standard port: {len(sus['modbus_over_nonstandard_port'])}")
+    for src, dst, port in sus["modbus_over_nonstandard_port"][:15]:
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)} on port {port}")
+    if sus["modbus_over_nonstandard_port"]:
+        kb_block(md, "modbus_nonstandard_port")
+    md.append("")
+
+    md.append(f"### Malformed / suspect packets: {len(sus['malformed_packet_flags'])}")
+    for src, dst, reason in sus["malformed_packet_flags"][:15]:
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)}: {reason}")
+    if sus["malformed_packet_flags"]:
+        kb_block(md, "malformed_packets")
+    md.append("")
+
+    md.append(f"### Long TCP sessions (possible tunneling): "
+               f"{len(sus['long_tcp_sessions_bytes_in_flight'])}")
+    md.append("*Sessions with an internet endpoint over 10 KB, or internal sessions over 1 MB on ports that aren't a known OT/IT service.*")
+    for conv, total in sus["long_tcp_sessions_bytes_in_flight"].items():
+        md.append(f"- {conv}: {total} bytes")
+    if sus["long_tcp_sessions_bytes_in_flight"]:
+        kb_block(md, "long_tcp_sessions")
+    md.append("")
+
+    md.append(f"### OT/ICS traffic reaching the public internet: {len(sus['ot_traffic_to_internet'])}")
+    from .detect import is_public
+    for src, dst in sus["ot_traffic_to_internet"][:15]:
+        direction = "inbound from the internet" if is_public(src) else "outbound to the internet"
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)} ({direction})")
+    if sus["ot_traffic_to_internet"]:
+        kb_block(md, "ot_to_internet")
+    else:
+        md.append("- None detected -- no packets left private address space.")
+    md.append("")
+
+    md.append("## Modbus Protocol Detail\n")
+    md.append(f"- Modbus conversations (port 502): **{len(mb['conversations'])}**")
+    for src, dst in mb["conversations"][:15]:
+        md.append(f"  - {annotate_host(src, assets)} ↔ {annotate_host(dst, assets)}")
+
+    w_events = ([(s, d, "Write Single Coil") for s, d in mb["write_single_coil_events"]]
+                + [(s, d, "Write Single Register") for s, d in mb.get("write_single_register_events", [])]
+                + [(s, d, "Write Multiple Registers") for s, d in mb["write_multiple_registers_events"]]
+                + list(mb.get("write_other_events", [])))
+    write_total = len(w_events)
+    by_type = {}
+    for _, _, name in w_events:
+        by_type[name] = by_type.get(name, 0) + 1
+    md.append(f"\n### Write commands: {write_total}"
+              + (" (" + ", ".join(f"{k}: {v}" for k, v in by_type.items()) + ")" if by_type else ""))
+    for src, dst, name in w_events[:15]:
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)}: {name}")
+    if write_total:
+        kb_block(md, "modbus_write")
+    md.append("")
+
+    md.append(f"### Device Identification requests: {len(mb['device_identification_events'])}")
+    for src, dst in mb["device_identification_events"][:15]:
+        md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)}")
+    if mb["device_identification_events"]:
+        kb_block(md, "modbus_device_id")
+    md.append("")
+
+    if mb["function_code_counts"]:
+        md.append("### Full function code distribution")
+        for code, count in sorted(mb["function_code_counts"].items(), key=lambda x: -x[1]):
+            md.append(f"- code {code}: {count}")
+    md.append("")
+
+    ctrl = getattr(findings, "control", {}) or {}
+    md.append("## Control, Restart and Logic Commands (all OT protocols)\n")
+    for key, label, items in (("ot_restart", "Device restart / STOP commands", ctrl.get("restarts", [])),
+                              ("program_download", "Program / logic changes", ctrl.get("program_changes", [])),
+                              ("ot_control_commands", "Control / write commands (non-Modbus)", ctrl.get("commands", []))):
+        md.append(f"### {label}: {len(items)}")
+        for src, dst, proto, detail in items[:15]:
+            md.append(f"- {annotate_host(src, assets)} → {annotate_host(dst, assets)}: {proto} {detail}")
+        if len(items) > 15:
+            md.append(f"- ... and {len(items) - 15} more")
+        if items:
+            kb_block(md, key)
+        md.append("")
+    gs = ctrl.get("goose_multiple_publishers", {})
+    md.append(f"### GOOSE control blocks with more than one publisher: {len(gs)}")
+    for gocb, pubs in gs.items():
+        md.append(f"- `{gocb}`: " + "; ".join(f"{mac} (stNum {', '.join(str(x) for x in sts)})" for mac, sts in pubs.items()))
+    if gs:
+        kb_block(md, "goose_spoof")
+    md.append("")
+
+    md.append("## Other OT/ICS Protocols Observed\n")
+    if findings.other_protocols:
+        for proto, convs in findings.other_protocols.items():
+            md.append(f"### {proto}: {len(convs)} conversation(s)")
+            for src, dst in convs[:10]:
+                md.append(f"- {annotate_host(src, assets)} ↔ {annotate_host(dst, assets)}")
+    else:
+        md.append("- None of Modbus / S7 / IEC 61850 MMS / DNP3 / IEC 60870-5-104 / EtherNet/IP / "
+                   "Profinet / GOOSE / Sampled Values / BACnet observed in this capture.")
+    md.append("")
+
+    if baseline_diff is not None:
+        md.append("## New Since Baseline\n")
+        bd = baseline_diff
+        md.append(f"- New MAC addresses: **{len(bd['new_macs'])}**")
+        for m in bd["new_macs"][:20]:
+            md.append(f"  - {m}")
+        md.append(f"- New ARP IP↔MAC pairs: **{len(bd['new_arp_pairs'])}**")
+        for p in bd["new_arp_pairs"][:20]:
+            md.append(f"  - {p}")
+        md.append(f"- New high-order ports observed: **{len(bd['new_high_order_ports'])}**")
+        for p in bd["new_high_order_ports"][:20]:
+            md.append(f"  - {p}")
+        md.append(f"- New Modbus conversations: **{len(bd['new_modbus_conversations'])}**")
+        for c in bd["new_modbus_conversations"][:20]:
+            md.append(f"  - {c}")
+        md.append(f"- New public-internet destinations: **{len(bd['new_internet_destinations'])}**")
+        for d in bd["new_internet_destinations"][:20]:
+            md.append(f"  - {d}")
+        if bd["new_other_protocol_conversations"]:
+            md.append("- New conversations in other OT/ICS protocols:")
+            for proto, convs in bd["new_other_protocol_conversations"].items():
+                md.append(f"  - **{proto}**: {len(convs)} new")
+                for c in convs[:10]:
+                    md.append(f"    - {c}")
+        md.append("")
+
+    if trend_md:
+        md.append(trend_md)
+        md.append("")
+
+    if crossref_md:
+        md.append(crossref_md)
+        md.append("")
+
+    md.append("---")
+    md.append("*Generated by ot_pcap_triage. Detection logic mirrors the \"Wireshark for "
+               "OT Cybersecurity\" filter reference. Severity, ATT&CK tagging, and remediation "
+               "guidance are decision support, not a substitute for analyst judgment -- confirm "
+               "flagged items against asset ownership and change records before treating them as "
+               "confirmed incidents.*")
+
+    return "\n".join(md), summary_rows

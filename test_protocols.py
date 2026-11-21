@@ -1,23 +1,18 @@
 from ot_pcap_triage import triage
 
 
-def test_port_scan_detected(port_scan_pcap):
-    findings = triage(port_scan_pcap)
-    scanners = findings.suspicious["possible_port_scanners"]
-    assert "10.0.0.99" in scanners
-    assert len(scanners["10.0.0.99"]) == 20
+def test_iec104_detected(iec104_pcap):
+    findings = triage(iec104_pcap)
+    assert "IEC 60870-5-104" in findings.other_protocols
+    assert ("10.0.0.5", "10.0.0.60") in findings.other_protocols["IEC 60870-5-104"]
 
 
-def test_no_false_positive_scan_on_normal_traffic(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    assert findings.suspicious["possible_port_scanners"] == {}
+def test_goose_detected(goose_pcap):
+    findings = triage(goose_pcap)
+    assert "IEC 61850 GOOSE" in findings.other_protocols
 
 
-def test_internet_traffic_flagged(internet_traffic_pcap):
-    findings = triage(internet_traffic_pcap)
-    assert ("10.0.0.5", "8.8.8.8") in findings.suspicious["ot_traffic_to_internet"]
-
-
-def test_private_traffic_not_flagged_as_internet(modbus_write_pcap):
-    findings = triage(modbus_write_pcap)
-    assert findings.suspicious["ot_traffic_to_internet"] == []
+def test_arp_response_recorded(arp_pcap):
+    findings = triage(arp_pcap)
+    assert findings.network_discovery["arp_response_count"] == 1
+    assert ("10.0.0.5", "aa:bb:cc:dd:ee:01") in findings.network_discovery["arp_responses"]

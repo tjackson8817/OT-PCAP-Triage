@@ -1,6 +1,29 @@
-ip,role,name
-192.168.1.10,Engineering Workstation,EWS-1
-192.168.1.20,HMI,HMI-Line3
-192.168.1.5,PLC/RTU,PLC-Mixer1
-192.168.1.2,SCADA Server,SCADA-Primary
-192.168.1.50,Historian,Historian-01
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ot-pcap-triage"
+version = "2.1.0"
+description = "Triage OT/ICS packet captures against known risk indicators, with severity, mitigation guidance, and MITRE ATT&CK for ICS tagging."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Thomas Jackson" }]
+dependencies = [
+    "scapy>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+pdf = [
+    "weasyprint>=60",
+]
+
+[project.scripts]
+ot-pcap-triage = "ot_pcap_triage.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
